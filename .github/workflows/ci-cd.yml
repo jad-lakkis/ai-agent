@@ -1,0 +1,135 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # GHCR needs a lowercase name. It is written out in full so the Windows and
+  # macOS deploy steps can use it too (no bash-only ${VAR,,} there).
+  IMAGE: ghcr.io/jad-lakkis/ai-agent:latest
+
+jobs:
+  # CI: run the Django checks and tests. If this fails nothing is built or deployed.
+  test:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      # chat/agent.py reads this when it is imported. The tests never call Gemini,
+      # so a placeholder is enough here. The real key is only used at deploy time.
+      GEMINI_API_KEY: ci-placeholder
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Django system check
+        run: python manage.py check
+
+      - name: Check that no migration is missing
+        run: python manage.py makemigrations --check --dry-run
+
+      - name: Run tests
+        run: python manage.py test
+
+  # CI: build the Docker image and publish it to GitHub Container Registry.
+  build:
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Docker image
+        run: >
+          docker build
+          --label org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          -t "${{ env.IMAGE }}" .
+
+      - name: Push Docker image
+        run: docker push "${{ env.IMAGE }}"
+
+  # CD: the lab machine runs a self-hosted runner with the label "ai-agent-deploy".
+  # It pulls the new image and replaces the running container.
+  deploy:
+    needs: build
+    runs-on: [self-hosted, ai-agent-deploy]
+    permissions:
+      contents: read
+      packages: read
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    steps:
+      - name: Require the GEMINI_API_KEY secret
+        if: env.GEMINI_API_KEY == ''
+        run: |
+          echo "::error::Add a repository secret named GEMINI_API_KEY (Settings > Secrets and variables > Actions)."
+          exit 1
+
+      - name: Check Docker
+        run: docker info
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The image is built on an amd64 runner, so ask for amd64 on every OS
+      # (this also makes it work on Apple Silicon Macs).
+      - name: Pull the new image
+        run: docker pull --platform linux/amd64 ${{ env.IMAGE }}
+
+      # The key is passed with "-e GEMINI_API_KEY" (no value) so Docker reads it
+      # from the step's environment and it never appears on the command line.
+      - name: Replace the container (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -File {0}
+        run: |
+          $existing = docker ps -aq --filter 'name=^/ai-agent$'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          if ($existing) {
+            docker rm -f ai-agent
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+          docker run -d --platform linux/amd64 --name ai-agent -p 127.0.0.1:8000:8000 -e GEMINI_API_KEY ${{ env.IMAGE }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          Start-Sleep -Seconds 5
+          if (-not (docker ps -q --filter 'name=^/ai-agent$' --filter status=running)) {
+            docker logs ai-agent
+            exit 1
+          }
+
+      - name: Replace the container (macOS / Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          docker rm -f ai-agent 2>/dev/null || true
+          docker run -d --platform linux/amd64 --name ai-agent -p 127.0.0.1:8000:8000 -e GEMINI_API_KEY "${{ env.IMAGE }}"
+
+          sleep 5
+          if [ -z "$(docker ps -q --filter 'name=^/ai-agent$' --filter status=running)" ]; then
+            docker logs ai-agent
+            exit 1
+          fi

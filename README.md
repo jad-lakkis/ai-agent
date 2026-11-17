@@ -18,7 +18,29 @@ docker run -d --name ai-agent -p 8000:8000 -e GEMINI_API_KEY=your-key-here ghcr.
 Open http://localhost:8000/
 
 The image is built and pushed to the GitHub Container Registry automatically by
-`.github/workflows/docker.yml` on every push to `main`.
+`.github/workflows/ci-cd.yml` on every push to `main`.
+
+## CI/CD pipeline
+
+`.github/workflows/ci-cd.yml` runs on every push to `main` (or manually from the
+Actions tab) and has three jobs. Each one only starts if the previous one passed.
+
+| Job | Runs on | What it does |
+|---|---|---|
+| `test` | GitHub-hosted Ubuntu | Installs dependencies, then runs `manage.py check`, a missing-migrations check and `manage.py test` |
+| `build` | GitHub-hosted Ubuntu | Builds the Docker image and pushes it to `ghcr.io/jad-lakkis/ai-agent:latest` |
+| `deploy` | Self-hosted runner (label `ai-agent-deploy`) | Pulls the new image and replaces the `ai-agent` container on port 8000 |
+
+### One-time setup for the deploy job
+
+1. **Secret:** in the repo go to Settings > Secrets and variables > Actions and add a
+   repository secret named `GEMINI_API_KEY` (or run `gh secret set GEMINI_API_KEY`).
+   The deploy job fails with a clear message if it is missing.
+2. **Runner:** on the machine that should host the app (needs Docker running), go to
+   Settings > Actions > Runners > New self-hosted runner, follow the download and
+   `config` steps, and when asked for extra labels enter `ai-agent-deploy`.
+   Then start it with `run.cmd` (Windows) or `./run.sh` (macOS / Linux).
+3. Push to `main`. When the run finishes, open http://localhost:8000/ on the runner machine.
 
 ## Build and run locally
 
